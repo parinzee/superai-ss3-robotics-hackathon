@@ -41,7 +41,8 @@ import json
 import time
 import sys
 import copy
-
+from copy import deepcopy
+import itertools
 
 ### ============= INITIAL RARAMETERS ============= ###
 
@@ -50,10 +51,11 @@ Y_INIT          = 0.
 THETA_INIT      = 0.
 X_GOAL          = 0.542760
 Y_GOAL          = 0.520140
-SENSOR_SECTION  = 20
+SENSOR_SECTION  = 60
 MIN_RANGE       = 0.136
 DIR_PATH = os.path.dirname(os.path.realpath(__file__))
 DIS_START_GOAL = np.sqrt((X_INIT - X_GOAL)**2 + (Y_INIT - Y_GOAL)**2)
+SEED = 42
 
 ### ============================================== ###
 
@@ -194,329 +196,458 @@ def action_unnormalized(action, high, low):
 
 ### ============================================== ###
 
-### MORE CLASS ###
+### Neural Network Class ###
 class ReplayBuffer:
     """
-    : Description : Storing experience of robot state and action for stopping the temporal correlations 
-                    between different episodes in the training phase
+    A simple FIFO experience replay buffer for agents.
     """
-    def __init__(self, capacity):
-        self.capacity = capacity                    # Set maximum size of buffer storage
-        self.buffer = []                            # Set initial buffer be empty set
-        self.position = 0                           # Set initial position to zero
 
-    def push(self, state, action, reward, next_state, done):
+    def __init__(self, obs_dim, act_dim, max_size):
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.max_size = max_size
+        self.obs_buf = np.zeros((max_size, obs_dim), dtype=np.float32)
+        self.obs2_buf = np.zeros((max_size, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros((max_size, act_dim), dtype=np.float32)
+        self.rew_buf = np.zeros(max_size, dtype=np.float32)
+        self.done_buf = np.zeros(max_size, dtype=np.float32)
+        self.ptr, self.size = 0, 0
+
+    def store(self, obs, act, rew, next_obs, done):
+        self.obs_buf[self.ptr] = obs
+        self.act_buf[self.ptr] = act
+        self.rew_buf[self.ptr] = rew
+        self.obs2_buf[self.ptr] = list(next_obs)
+        self.done_buf[self.ptr] = done
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+
+    def sample_batch(self, batch_size=32):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        batch = dict(obs=self.obs_buf[idxs],
+                     obs2=self.obs2_buf[idxs],
+                     act=self.act_buf[idxs],
+                     rew=self.rew_buf[idxs],
+                     done=self.done_buf[idxs])
+        return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in batch.items()}
+
+    def sample_batch_with_history(self, batch_size=32, max_hist_len=100):
         """
-        : Description : Add new experience to buffer, if buffer is full the oldest one will be rewrite
+        :param batch_size:
+        :param max_hist_len: the length of experiences before current experience
+        :return:
         """
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done)
-        self.position = (self.position + 1) % self.capacity
-
-    def sample(self, batch_size):
-        """
-        : Description : Get random sample of experience from Replay buffer based on batch size
-                        ! Note: The sample should be used when ReplayBuffer's size > batch size !
-        """
-        batch = random.sample(self.buffer, batch_size)
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch = map(np.stack, zip(*batch))
-        return state_batch, action_batch, reward_batch, next_state_batch, done_batch
-    
-    def __len__(self):
-        """
-        : Description : Get length of Replay buffer
-        """
-        return len(self.buffer)
-
-class ActorNetwork(nn.Module):
-    """
-    : Description : The network for giving Policy
-    """
-    def __init__(self, state_dim, action_dim, hidden_dim, log_std_min=-20, log_std_max=2):
-        super().__init__()
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-
-        self.l1 = nn.Linear(state_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.lstm = nn.LSTM(hidden_dim, hidden_dim)
-        self.mean_linear = nn.Linear(hidden_dim, action_dim)        # Get output as mean
-        self.log_std_linear = nn.Linear(hidden_dim, action_dim)     # Get another output as log standard deviation
-
-        self.apply(init_weight)                                     # Initial weight of model
-    
-    def forward(self, state):
-        """
-        : Description : Feed forward of Actor network for creating policy
-        : Input : 
-            state - The current state of robot including 
-                    [n] Current LiDAR sensor, [1] previous V, [1] previous W, [1] Current distance from target, 
-                    and [1] Current angle from target
-        : Output : 
-            mean        - The value for assign mean of action data
-            log_stad    - The value for assing log standard deviation that bounded between log_std_min and log_std_max
-        """
-        x = F.relu(self.l1(state))
-        x = F.relu(self.l2(x))
-        mean = self.mean_linear(x)
-        log_std = self.log_std_linear(x)
-        log_std = torch.clamp(log_std, min=self.log_std_min, max=self.log_std_max)  # Set limit of minimum and maximum of log_std
-        return mean, log_std                                                        # Return Mean and Log stad
-    
-    def sample(self, state, epsilon=1e-6):
-        """
-        : Description : Get sample of action from normal distribution based on mean and log_std value from feed forward
-        : Input : 
-            state   - List(float32) =>  The current state of robot including 
-                                        Current LiDAR sensor, previous V, previous W, Current distance from target, 
-                                        Current angle from target
-            epsilon - List(float32) =>  Constant value from calculating log probrability
-        : output : 
-            action  - List(float32) =>  Predicted action for Robot moving including [1] Linear velocity (v) and 
-                                        [1] Angular velocity (w)
-            log_prob- float32       =>  Logarithm of policy probrability
-            mean    - float32       =>  Average of policy
-            log_std - float32       =>  Log of standard deviation of policy
-        """
-        mean, log_std = self.forward(state)                             # Get mean and log std from feed forward
-        std = log_std.exp()                                             # Get standard deviation
-        normal = Normal(mean, std)                                      # Get Normal distribution curve
-        xt = normal.rsample()                                           # Get parameterized sample from normal distribution
-        action = torch.tanh(xt)                                         # Get action in bound of [-1, 1]
-        log_prob = normal.log_prob(xt)                                  # Get log of policy probrability
-        log_prob = log_prob - torch.log(1-action.pow(2) + epsilon)      # 
-        log_prob = log_prob.sum(1, keepdim=True)                        # Get final log prob by summation
-
-        return action, log_prob, mean, log_std
-
-class CriticNetwork(nn.Module):
-    """
-    : Description : The network for giving Q-table
-    """
-    def __init__(self, state_dim, action_dim, hidden_dim):
-        super().__init__()
-
-        # Q1
-        self.l1_q1 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.l2_q1 = nn.Linear(hidden_dim, hidden_dim)
-        self.l3_q1 = nn.Linear(hidden_dim, hidden_dim)
-        self.l4_q1 = nn.Linear(hidden_dim, 1)
-
-        #Q2
-        self.l1_q2 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.l2_q2 = nn.Linear(hidden_dim, hidden_dim)
-        self.l3_q2 = nn.Linear(hidden_dim, hidden_dim)
-        self.l4_q2 = nn.Linear(hidden_dim, 1)
-
-        self.apply(init_weight)
-    
-    def forward(self, state, action):
-        """
-        : Description : Feedforward data to Critic network
-        : Input :
-            state  - List(float32)  =>  The list of [n] current sensor data, [1] previous v, [1] previous w, 
-                                        [1] current goal angle, and [1] current goal distance
-            action - List(float32)  =>  The list of [1] current v, and [1] current w which get from Actor Network
-        : Output :
-            x1     - float32        =>  Q-value that predicted by Critic network 1
-            x2     - float32        =>  Q-value that predicted by Critic network 2
-        """
-        state_action = torch.cat([state, action], 1)        # Concat state and action to be input data
-
-        x1 = F.relu(self.l1_q1(state_action))               # Duplicated network for more efficiency
-        x1 = F.relu(self.l2_q1(x1))
-        x1 = F.relu(self.l3_q1(x1))
-        x1 = self.l4_q1(x1)
-
-
-        x2 = F.relu(self.l1_q2(state_action))               # Duplicated network for more efficiency
-        x2 = F.relu(self.l2_q2(x2))
-        x2 = F.relu(self.l3_q2(x2))
-        x2 = self.l4_q2(x2)
-
-        return x1, x2
-
-class SAC(object):
-    """
-    : Description : Soft Action-Critic model
-    """
-    def __init__(self, 
-                 state_dim,
-                 action_dim,
-                 gamma = 0.99,
-                 tau = 1e-2,
-                 alpha = 0.2,
-                 hidden_dim = 256,
-                 lr = 3e-4
-                 ):
-        self.gamma = gamma      # Decay rate
-        self.tau = tau
-        self.alpha = alpha
-        self.lr = lr
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')              # Get device for processing
-
-        ### Actor-Critic model ###
-        # Get Policy from Actor Network
-        self.policy = ActorNetwork(state_dim, action_dim, hidden_dim).to(self.device)           # Actor Network
-        self.policy_optim = Adam(self.policy.parameters(), lr=self.lr)                          # Set optimization to Actor Network
-
-        # Get Q-value from Critic Netwokr
-        self.critic = CriticNetwork(state_dim, action_dim, hidden_dim).to(self.device)          # Critic Network
-        self.critic_optim = Adam(self.critic.parameters(), lr=self.lr)                          # Set optimization to Critic Network
-        self.critic_target = CriticNetwork(state_dim, action_dim, hidden_dim).to(self.device)   # Duplicated critic network
-        hard_update(self.critic_target, self.critic)                                            # Hard copy weight to set duplicated network
-
-        # Entropy
-        self.target_entropy = torch.prod(torch.Tensor([action_dim]).to(self.device)).item()     # Get product of action dimension?
-
-        # Alpha
-        self.log_alpha = torch.zeros(1, requires_grad = True, device=self.device)               # Create 1x1 tensor to be log_alpha
-        self.alpha_optim = Adam([self.log_alpha], lr=self.lr)                                   # Set optimization to log_alpha
-
-    def select_action(self, state, eval=False):
-        """
-        : Description : Select action from policy distribution
-        : Input : 
-            state - List(float32)   =>  The current state of robot including 
-                                        [n] Current LiDAR sensor, [1] previous V, [1] previous W, 
-                                        [1] Current distance from target, and [1] Current angle from target
-            eval  - Boolean         =>  select action for evaluation (True) / for training (False)
-        : Output :
-            action - List(float32)  =>  The list of [1] current v, and [1] current w
-        """
-        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
-        if not eval:
-            action, _, _, _ = self.policy.sample(state)     # Select real action if model is training
+        idxs = np.random.randint(max_hist_len, self.size, size=batch_size)
+        # History
+        if max_hist_len == 0:
+            hist_obs = np.zeros([batch_size, 1, self.obs_dim])
+            hist_act = np.zeros([batch_size, 1, self.act_dim])
+            hist_obs2 = np.zeros([batch_size, 1, self.obs_dim])
+            hist_act2 = np.zeros([batch_size, 1, self.act_dim])
+            hist_obs_len = np.zeros(batch_size)
+            hist_obs2_len = np.zeros(batch_size)
         else:
-            _, _, action, _ = self.policy.sample(state)     # Select mean value of policy if model is evaluation
+            hist_obs = np.zeros([batch_size, max_hist_len, self.obs_dim])
+            hist_act = np.zeros([batch_size, max_hist_len, self.act_dim])
+            hist_obs_len = max_hist_len * np.ones(batch_size)
+            hist_obs2 = np.zeros([batch_size, max_hist_len, self.obs_dim])
+            hist_act2 = np.zeros([batch_size, max_hist_len, self.act_dim])
+            hist_obs2_len = max_hist_len * np.ones(batch_size)
 
-        action = action.detach().cpu().numpy()[0]
-        return action
-    
-    def update_parameters(self, replay_bf, batch_size):
-        """
-        : Description : 
-        : Input :
-            replay_bf - List(Object)   =>  Experience data that contained by ReplayBuffer
-                                           which includes state, action, reward, next_state, done
-            batch_size - Integer       =>  Sample size for collecting from ReplayBuffer
-        """
-        # Get sample expereince from buffer
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch = replay_bf.sample(batch_size=batch_size)
-        state_batch = torch.FloatTensor(state_batch).to(self.device)
-        action_batch = torch.FloatTensor(action_batch).to(self.device)
-        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
-        reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)     # Add dimension
-        done_batch = torch.FloatTensor(done_batch).to(self.device).unsqueeze(1)         # Add dimension
+            # Extract history experiences before sampled index
+            for i, id in enumerate(idxs):
+                hist_start_id = id - max_hist_len
+                if hist_start_id < 0:
+                    hist_start_id = 0
+                # If exist done before the last experience (not including the done in id), start from the index next to the done.
+                if len(np.where(self.done_buf[hist_start_id:id] == 1)[0]) != 0:
+                    hist_start_id = hist_start_id + (np.where(self.done_buf[hist_start_id:id] == 1)[0][-1]) + 1
+                hist_seg_len = id - hist_start_id
+                hist_obs_len[i] = hist_seg_len
+                hist_obs[i, :hist_seg_len, :] = self.obs_buf[hist_start_id:id]
+                hist_act[i, :hist_seg_len, :] = self.act_buf[hist_start_id:id]
+                # If the first experience of an episode is sampled, the hist lengths are different for obs and obs2.
+                if hist_seg_len == 0:
+                    hist_obs2_len[i] = 1
+                else:
+                    hist_obs2_len[i] = hist_seg_len
+                hist_obs2[i, :hist_seg_len, :] = self.obs2_buf[hist_start_id:id]
+                hist_act2[i, :hist_seg_len, :] = self.act_buf[hist_start_id+1:id+1]
 
-        # CALCULATE PREDICTION
+        batch = dict(obs=self.obs_buf[idxs],
+                     obs2=self.obs2_buf[idxs],
+                     act=self.act_buf[idxs],
+                     rew=self.rew_buf[idxs],
+                     done=self.done_buf[idxs],
+                     hist_obs=hist_obs,
+                     hist_act=hist_act,
+                     hist_obs2=hist_obs2,
+                     hist_act2=hist_act2,
+                     hist_obs_len=hist_obs_len,
+                     hist_obs2_len=hist_obs2_len)
+        return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in batch.items()}
+
+
+class MLPCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim,
+                 mem_pre_lstm_hid_sizes=(128,),
+                 mem_lstm_hid_sizes=(128,),
+                 mem_after_lstm_hid_size=(128,),
+                 cur_feature_hid_sizes=(128,),
+                 post_comb_hid_sizes=(128,),
+                 hist_with_past_act=False):
+        super(MLPCritic, self).__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.hist_with_past_act = hist_with_past_act
+        #
+        self.mem_pre_lstm_layers = nn.ModuleList()
+        self.mem_lstm_layers = nn.ModuleList()
+        self.mem_after_lstm_layers = nn.ModuleList()
+
+        self.cur_feature_layers = nn.ModuleList()
+        self.post_combined_layers = nn.ModuleList()
+        # Memory
+        #    Pre-LSTM
+        if self.hist_with_past_act:
+            mem_pre_lstm_layer_size = [obs_dim + act_dim] + list(mem_pre_lstm_hid_sizes)
+        else:
+            mem_pre_lstm_layer_size = [obs_dim] + list(mem_pre_lstm_hid_sizes)
+        for h in range(len(mem_pre_lstm_layer_size) - 1):
+            self.mem_pre_lstm_layers += [nn.Linear(mem_pre_lstm_layer_size[h],
+                                                   mem_pre_lstm_layer_size[h + 1]),
+                                         nn.ReLU()]
+        #    LSTM
+        self.mem_lstm_layer_sizes = [mem_pre_lstm_layer_size[-1]] + list(mem_lstm_hid_sizes)
+        for h in range(len(self.mem_lstm_layer_sizes) - 1):
+            self.mem_lstm_layers += [
+                nn.LSTM(self.mem_lstm_layer_sizes[h], self.mem_lstm_layer_sizes[h + 1], batch_first=True)]
+
+        #   After-LSTM
+        self.mem_after_lstm_layer_size = [self.mem_lstm_layer_sizes[-1]] + list(mem_after_lstm_hid_size)
+        for h in range(len(self.mem_after_lstm_layer_size)-1):
+            self.mem_after_lstm_layers += [nn.Linear(self.mem_after_lstm_layer_size[h],
+                                                     self.mem_after_lstm_layer_size[h+1]),
+                                           nn.ReLU()]
+
+        # Current Feature Extraction
+        cur_feature_layer_size = [obs_dim + act_dim] + list(cur_feature_hid_sizes)
+        for h in range(len(cur_feature_layer_size) - 1):
+            self.cur_feature_layers += [nn.Linear(cur_feature_layer_size[h], cur_feature_layer_size[h + 1]),
+                                        nn.ReLU()]
+
+        # Post-Combination
+        post_combined_layer_size = [self.mem_after_lstm_layer_size[-1] + cur_feature_layer_size[-1]] + list(
+            post_comb_hid_sizes) + [1]
+        for h in range(len(post_combined_layer_size) - 2):
+            self.post_combined_layers += [nn.Linear(post_combined_layer_size[h], post_combined_layer_size[h + 1]),
+                                          nn.ReLU()]
+        self.post_combined_layers += [nn.Linear(post_combined_layer_size[-2], post_combined_layer_size[-1]),
+                                      nn.Identity()]
+
+    def forward(self, obs, act, hist_obs, hist_act, hist_seg_len):
+        #
+        tmp_hist_seg_len = deepcopy(hist_seg_len)
+        tmp_hist_seg_len[hist_seg_len == 0] = 1
+        if self.hist_with_past_act:
+            x = torch.cat([hist_obs, hist_act], dim=-1)
+        else:
+            x = hist_obs
+        # Memory
+        #    Pre-LSTM
+        for layer in self.mem_pre_lstm_layers:
+            x = layer(x)
+        #    LSTM
+        for layer in self.mem_lstm_layers:
+            x, (lstm_hidden_state, lstm_cell_state) = layer(x)
+        #    After-LSTM
+        for layer in self.mem_after_lstm_layers:
+            x = layer(x)
+        #    History output mask to reduce disturbance cased by none history memory
+        hist_out = torch.gather(x, 1,
+                                (tmp_hist_seg_len - 1).view(-1, 1).repeat(1, self.mem_after_lstm_layer_size[-1]).unsqueeze(
+                                    1).long()).squeeze(1)
+
+        # Current Feature Extraction
+        x = torch.cat([obs, act], dim=-1)
+        for layer in self.cur_feature_layers:
+            x = layer(x)
+
+        # Post-Combination
+        extracted_memory = hist_out
+        x = torch.cat([extracted_memory, x], dim=-1)
+
+        for layer in self.post_combined_layers:
+            x = layer(x)
+        # squeeze(x, -1) : critical to ensure q has right shape.
+        return torch.squeeze(x, -1), extracted_memory
+
+
+class MLPActor(nn.Module):
+    def __init__(self, obs_dim, act_dim, act_limit,
+                 mem_pre_lstm_hid_sizes=(128,),
+                 mem_lstm_hid_sizes=(128,),
+                 mem_after_lstm_hid_size=(128,),
+                 cur_feature_hid_sizes=(128,),
+                 post_comb_hid_sizes=(128,),
+                 hist_with_past_act=False):
+        super(MLPActor, self).__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.act_limit = act_limit
+        self.hist_with_past_act = hist_with_past_act
+        #
+        self.mem_pre_lstm_layers = nn.ModuleList()
+        self.mem_lstm_layers = nn.ModuleList()
+        self.mem_after_lstm_layers = nn.ModuleList()
+
+        self.cur_feature_layers = nn.ModuleList()
+        self.post_combined_layers = nn.ModuleList()
+
+        # Memory
+        #    Pre-LSTM
+        if self.hist_with_past_act:
+            mem_pre_lstm_layer_size = [obs_dim + act_dim] + list(mem_pre_lstm_hid_sizes)
+        else:
+            mem_pre_lstm_layer_size = [obs_dim] + list(mem_pre_lstm_hid_sizes)
+        for h in range(len(mem_pre_lstm_layer_size) - 1):
+            self.mem_pre_lstm_layers += [nn.Linear(mem_pre_lstm_layer_size[h],
+                                                   mem_pre_lstm_layer_size[h + 1]),
+                                         nn.ReLU()]
+        #    LSTM
+        self.mem_lstm_layer_sizes = [mem_pre_lstm_layer_size[-1]] + list(mem_lstm_hid_sizes)
+        for h in range(len(self.mem_lstm_layer_sizes) - 1):
+            self.mem_lstm_layers += [
+                nn.LSTM(self.mem_lstm_layer_sizes[h], self.mem_lstm_layer_sizes[h + 1], batch_first=True)]
+        #   After-LSTM
+        self.mem_after_lstm_layer_size = [self.mem_lstm_layer_sizes[-1]] + list(mem_after_lstm_hid_size)
+        for h in range(len(self.mem_after_lstm_layer_size) - 1):
+            self.mem_after_lstm_layers += [nn.Linear(self.mem_after_lstm_layer_size[h],
+                                                     self.mem_after_lstm_layer_size[h + 1]),
+                                           nn.ReLU()]
+
+        # Current Feature Extraction
+        cur_feature_layer_size = [obs_dim] + list(cur_feature_hid_sizes)
+        for h in range(len(cur_feature_layer_size) - 1):
+            self.cur_feature_layers += [nn.Linear(cur_feature_layer_size[h], cur_feature_layer_size[h + 1]),
+                                        nn.ReLU()]
+
+        # Post-Combination
+        post_combined_layer_size = [self.mem_after_lstm_layer_size[-1] + cur_feature_layer_size[-1]] + list(
+            post_comb_hid_sizes) + [act_dim]
+        for h in range(len(post_combined_layer_size) - 2):
+            self.post_combined_layers += [nn.Linear(post_combined_layer_size[h], post_combined_layer_size[h + 1]),
+                                          nn.ReLU()]
+        self.post_combined_layers += [nn.Linear(post_combined_layer_size[-2], post_combined_layer_size[-1]), nn.Tanh()]
+
+    def forward(self, obs, hist_obs, hist_act, hist_seg_len):
+        #
+        tmp_hist_seg_len = deepcopy(hist_seg_len)
+        tmp_hist_seg_len[hist_seg_len == 0] = 1
+        if self.hist_with_past_act:
+            x = torch.cat([hist_obs, hist_act], dim=-1)
+        else:
+            x = hist_obs
+        # Memory
+        #    Pre-LSTM
+        for layer in self.mem_pre_lstm_layers:
+            x = layer(x)
+        #    LSTM
+        for layer in self.mem_lstm_layers:
+            x, (lstm_hidden_state, lstm_cell_state) = layer(x)
+        #    After-LSTM
+        for layer in self.mem_after_lstm_layers:
+            x = layer(x)
+        hist_out = torch.gather(x, 1,
+                                (tmp_hist_seg_len - 1).view(-1, 1).repeat(1, self.mem_after_lstm_layer_size[-1]).unsqueeze(
+                                    1).long()).squeeze(1)
+
+        # Current Feature Extraction
+        x = obs
+        for layer in self.cur_feature_layers:
+            x = layer(x)
+
+        # Post-Combination
+        extracted_memory = hist_out
+        x = torch.cat([extracted_memory, x], dim=-1)
+
+        for layer in self.post_combined_layers:
+            x = layer(x)
+        return self.act_limit * x, extracted_memory
+
+
+class MLPActorCritic(nn.Module):
+    def __init__(self, obs_dim, act_dim, act_limit=1,
+                 critic_mem_pre_lstm_hid_sizes=(128,),
+                 critic_mem_lstm_hid_sizes=(128,),
+                 critic_mem_after_lstm_hid_size=(128,),
+                 critic_cur_feature_hid_sizes=(128,),
+                 critic_post_comb_hid_sizes=(128,),
+                 critic_hist_with_past_act=False,
+                 actor_mem_pre_lstm_hid_sizes=(128,),
+                 actor_mem_lstm_hid_sizes=(128,),
+                 actor_mem_after_lstm_hid_size=(128,),
+                 actor_cur_feature_hid_sizes=(128,),
+                 actor_post_comb_hid_sizes=(128,),
+                 actor_hist_with_past_act=False):
+        super(MLPActorCritic, self).__init__()
+        self.q1 = MLPCritic(obs_dim, act_dim,
+                            mem_pre_lstm_hid_sizes=critic_mem_pre_lstm_hid_sizes,
+                            mem_lstm_hid_sizes=critic_mem_lstm_hid_sizes,
+                            mem_after_lstm_hid_size=critic_mem_after_lstm_hid_size,
+                            cur_feature_hid_sizes=critic_cur_feature_hid_sizes,
+                            post_comb_hid_sizes=critic_post_comb_hid_sizes,
+                            hist_with_past_act=critic_hist_with_past_act)
+        self.q2 = MLPCritic(obs_dim, act_dim,
+                            mem_pre_lstm_hid_sizes=critic_mem_pre_lstm_hid_sizes,
+                            mem_lstm_hid_sizes=critic_mem_lstm_hid_sizes,
+                            mem_after_lstm_hid_size=critic_mem_after_lstm_hid_size,
+                            cur_feature_hid_sizes=critic_cur_feature_hid_sizes,
+                            post_comb_hid_sizes=critic_post_comb_hid_sizes,
+                            hist_with_past_act=critic_hist_with_past_act)
+        self.pi = MLPActor(obs_dim, act_dim, act_limit,
+                           mem_pre_lstm_hid_sizes=actor_mem_pre_lstm_hid_sizes,
+                           mem_lstm_hid_sizes=actor_mem_lstm_hid_sizes,
+                           mem_after_lstm_hid_size=actor_mem_after_lstm_hid_size,
+                           cur_feature_hid_sizes=actor_cur_feature_hid_sizes,
+                           post_comb_hid_sizes=actor_post_comb_hid_sizes,
+                           hist_with_past_act=actor_hist_with_past_act)
+
+    def act(self, obs, hist_obs=None, hist_act=None, hist_seg_len=None, device=None):
+        if (hist_obs is None) or (hist_act is None) or (hist_seg_len is None):
+            hist_obs = torch.zeros(1, 1, self.obs_dim).to(device)
+            hist_act = torch.zeros(1, 1, self.act_dim).to(device)
+            hist_seg_len = torch.zeros(1).to(device)
         with torch.no_grad():
-            next_state_action, next_state_log_pi, _, _  = self.policy.sample(next_state_batch)                      # Get next state Policy
-            qf1_next_target, qf2_next_target            = self.critic_target(next_state_batch, next_state_action)   # Get next state Q-value
-            min_qf_next_target  = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi      # Set up minimum Q-value for next target
-            next_q_value        = reward_batch + (1 - done_batch) * self.gamma * (min_qf_next_target)               # Get Target
-        
-        qf1, qf2 = self.critic(state_batch, action_batch)   # Two Q-functions to mitigate positive bias in the policy improvement step
-        qf1_loss = F.mse_loss(qf1, next_q_value)            # Calculate MSE between Q-value from Critric 1 and actual
-        qf2_loss = F.mse_loss(qf2, next_q_value)            # Calculate MSE between Q-value from Critric 2 and actual
-        qf_loss = qf1_loss + qf2_loss                       # Set summation of MSE be loss function
+            act, _, = self.pi(obs, hist_obs, hist_act, hist_seg_len)
+            return act.cpu().numpy()
 
-        self.critic_optim.zero_grad()
-        qf_loss.backward()
-        self.critic_optim.step()
 
-        pi, log_pi, mean, log_std = self.policy.sample(state_batch)
+### ============================================== ###
 
-        qf1_pi, qf2_pi = self.critic(state_batch, pi)
-        min_qf_pi = torch.min(qf1_pi, qf2_pi)
-
-        policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean() 
-
-        self.policy_optim.zero_grad()
-        policy_loss.backward()
-        self.policy_optim.step()
-
-        alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-
-        self.alpha_optim.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optim.step()
-
-        self.alpha = self.log_alpha.exp()
-
-        soft_update(self.critic_target, self.critic, self.tau)
-
-    # Save model parameters
-    def save_models(self, episode_count):
-        torch.save(self.policy.state_dict(), DIR_PATH + '/model/' + str(episode_count)+ '_policy_net.pth')
-        torch.save(self.critic.state_dict(), DIR_PATH + '/model/' + str(episode_count)+ 'value_net.pth')
-        print("====================================")
-        print("...     Model has been saved     ...")
-        print("====================================")
-    
-    # Load model parameters
-    def load_models(self, episode, world):
-        self.policy.load_state_dict(torch.load(DIR_PATH + '/model/' + str(episode)+ '_policy_net.pth'))
-        self.critic.load_state_dict(torch.load(DIR_PATH + '/model/' + str(episode)+ 'value_net.pth'))
-        hard_update(self.critic_target, self.critic)
-        print('***Models load***')
 
 class LearningNode(Node):
+
     def __init__(self):
         super().__init__('test2')
-        print("Start train")
-        self.timer_period = .1 # seconds
+        print("=== Creating Model ===")
+        self.timer_period = .25 # seconds
         self.timer = self.create_timer(self.timer_period, self.call_back)
         self.velPub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.setPosPub = self.create_publisher(ModelState, 'gazebo/set_model_state', 10)
         self.ep_time = self.get_clock().now() 
         self.start_ep_time = self.get_clock().now() 
-        self.crash = 0
-        self.win = False
         self.dummy_req = Empty_Request()
         self.reset = self.create_client(Empty, '/reset_simulation')
         self.reset.call_async(self.dummy_req)
 
-        # parameter for running model
-        self.max_episodes = 10001
-        self.rewards = []
-        self.batch_size = 256
-        self.action_dim = 2
-        self.state_dim = 24 # TEST
-        self.hidden_dim = 500
-        self.v_min = 0.0    #m/s
-        self.v_max = 0.22   #m/s
-        self.w_min = -2.0   #rad/s
-        self.w_max = 2.0    #rad/s
-        self.replay_buffer_size = 50000
-        self.agent = SAC(self.state_dim, self.action_dim)
-        self.replay_buffer = ReplayBuffer(self.replay_buffer_size)
-        self.previous_action = np.array([0., 0.])
-        self.warm_up = 4
-        self.episode = 0
+        # Set Seed
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+        print("Running with seed: ", SEED)
+
+        # Env Settings
+        self.obs_dim = SENSOR_SECTION + 2 # LIDAR + distance + angle
+        self.act_dim = 2 # v, w
+        self.act_limit = 1
+        self.v_max = 0.6
+        self.w_max = 8
+        print("obs_dim: ", self.obs_dim)
+        print("act_dim: ", self.act_dim)
+        print("act_limit: ", self.act_limit)
+
+        # Model Hyper Parameters
+        self.steps_per_epoch=1000
+        self.epochs=100 
+        self.replay_size=int(5e6)
+        self.gamma=0.99
+        self.polyak=0.995
+        self.pi_lr=1e-3
+        self.q_lr=1e-3
+        self.start_steps=10000
+        self.update_after=1000
+        self.update_every=50
+        self.act_noise=0.1
+        self.target_noise=0.2
+        self.noise_clip=0.5
+        self.policy_delay=2
+        self.num_test_episodes=10
+        self.max_ep_len=1000
+        self.batch_size=100
+        self.max_hist_len=100
+        self.flicker_prob=0.2
+        self.random_noise_sigma=0.1
+        self.random_sensor_missing_prob=0.1
+        self.use_double_critic = True
+        self.use_target_policy_smooth = True
+        self.critic_mem_pre_lstm_hid_sizes=(128,)
+        self.critic_mem_lstm_hid_sizes=(128,)
+        self.critic_mem_after_lstm_hid_size=(128,)
+        self.critic_cur_feature_hid_sizes=(128,)
+        self.critic_post_comb_hid_sizes=(128,)
+        self.critic_hist_with_past_act=False
+        self.actor_mem_pre_lstm_hid_sizes=(128,)
+        self.actor_mem_lstm_hid_sizes=(128,)
+        self.actor_mem_after_lstm_hid_size=(128,)
+        self.actor_cur_feature_hid_sizes=(128,)
+        self.actor_post_comb_hid_sizes=(128,)
+        self.actor_hist_with_past_act=False
+        self.save_freq=1
+        self.total_steps = self.steps_per_epoch * self.epochs
+
+        # Data Variables
+        self.all_n_steps = 0
         self.tstep = 0
+        self.curr_epoch = 0
         self.done = False
-        self.current_episode = 0.
+        self.crash = False
+        self.win = False
         self.diff_angle = 0.
-        self.previous_distance = 0.
-        self.stop = 0
-        self.position = Pose()
-        self.prev_position = Pose()
-        self.total_rewards = 0
-        self.state = []
-        self.max_tstep = 300
+
+
+        # Initalize Model
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.ac = MLPActorCritic(self.obs_dim, self.act_dim, self.act_limit,
+                        critic_mem_pre_lstm_hid_sizes=self.critic_mem_pre_lstm_hid_sizes,
+                        critic_mem_lstm_hid_sizes=self.critic_mem_lstm_hid_sizes,
+                        critic_mem_after_lstm_hid_size=self.critic_mem_after_lstm_hid_size,
+                        critic_cur_feature_hid_sizes=self.critic_cur_feature_hid_sizes,
+                        critic_post_comb_hid_sizes=self.critic_post_comb_hid_sizes,
+                        critic_hist_with_past_act=self.critic_hist_with_past_act,
+                        actor_mem_pre_lstm_hid_sizes=self.actor_mem_pre_lstm_hid_sizes,
+                        actor_mem_lstm_hid_sizes=self.actor_mem_lstm_hid_sizes,
+                        actor_mem_after_lstm_hid_size=self.actor_mem_after_lstm_hid_size,
+                        actor_cur_feature_hid_sizes=self.actor_cur_feature_hid_sizes,
+                        actor_post_comb_hid_sizes=self.actor_post_comb_hid_sizes,
+                        actor_hist_with_past_act=self.actor_hist_with_past_act
+        )
+        self.ac_targ = deepcopy(self.ac)
+        self.ac.to(self.device)
+        self.ac_targ.to(self.device)
+
+        # Freeze target networks with respect to optimizers (only update via polyak averaging)
+        for p in self.ac_targ.parameters():
+            p.requires_grad = False
+
+        # List of parameters for both Q-networks (save this for convenience)
+        self.q_params = itertools.chain(self.ac.q1.parameters(), self.ac.q2.parameters())
+
+        # Experience buffer
+        self.replay_buffer = ReplayBuffer(obs_dim=self.obs_dim, act_dim=self.act_dim, max_size=self.replay_size)
+
+        # Set up optimizers for policy and q-function
+        self.pi_optimizer = Adam(self.ac.pi.parameters(), lr=self.pi_lr)
+        self.q_optimizer = Adam(self.q_params, lr=self.q_lr)
+
 
     def get_state(self, ranges_arr, past_action):
         """
         get current state
         """
         st_list = []
-        diff_angle = self.diff_angle
-        min_range = 0.136
+        # diff_angle = self.diff_angle
+        # min_range = 0.136
         max_range = 3.5
-        done = False
 
         # Handle value received from sensor
         for i in range(len(ranges_arr)):
@@ -528,9 +659,9 @@ class LearningNode(Node):
                 st_list.append(ranges_arr[i])
 
         # If the robot close to target
-        print('min(st_list)',min(st_list))
+        print('min(st_list)', min(st_list))
         if check_crash(st_list, MIN_RANGE):
-            done = True
+            self.done = True
 
         # Add previous v and w
         for pa in past_action:
@@ -544,31 +675,25 @@ class LearningNode(Node):
         at_list.append(current_distance)    # current distance
 
         # return st + at
-        return st_list + at_list, done
+        return st_list + at_list
 
-    def get_reward(self, state, done):
+    def get_reward(self, state):
         current_distance = state[-1]        # Get current distance from state
         diff_angle = state[-2]              # Get current different angle
 
-        distance_change = self.previous_distance - current_distance
-
-        # Set reward when distance_change
-        if distance_change > 0:
-            reward = 0.
-        else:
-            reward = 0.
-        
         print("self.position.x",self.position.x)
         print("self.prev_position.x",self.prev_position.x)
         
         print("self.position.y",self.position.y)
         #print("self.prev_position.x",self.prev_position.x)
         print("self.prev_position.y",self.prev_position.y)
+
         # Prevent Robot is stop
         x_now = round(self.position.x, 3)
         y_now = round(self.position.y, 3)
         x_prev = round(self.prev_position.x, 3)
         y_prev = round(self.prev_position.y, 3)
+
         if x_now == x_prev and y_now == y_prev:
             self.stop = self.stop + 1
             print('=== ROBOT IS STOP ===')
@@ -580,14 +705,21 @@ class LearningNode(Node):
         else:
             self.stop = 0
 
-        if done:
+        if self.done:
             # Reward for win
-            if self.win:
+            if self.win and not self.crash:
+                print('===!! ROBOT WON !!===')
                 reward = 100
+            
+            elif self.crash:
+                print('===!! ROBOT CRASH !!===')
+                reward = -100
+
             # Penalty for stop
             else:
                 reward = -5
-        return reward, done
+
+        return reward
 
     def step(self, action, past_action, ranges_arr):
         # get v, and w
@@ -598,14 +730,13 @@ class LearningNode(Node):
         self.publisher_vel(v,w)
 
         # get state
-        
-        state, done = self.get_state(ranges_arr, past_action)
+        state = self.get_state(ranges_arr, past_action)
         
         #print(state)
         # get reward from state
-        reward, done = self.get_reward(state, done)
+        reward = self.get_reward(state)
         print("reward------>",reward)
-        return np.asarray(state), reward, done
+        return np.asarray(state), reward 
         
 
     def call_back(self):
@@ -638,6 +769,143 @@ class LearningNode(Node):
         #     print(': win, reset')
         #     print("-------------------------------------winnn++++++++++++++++++++++++")
         #     self.reset_world()
+    
+    def compute_loss_q(self, data):
+        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+        h_o, h_a, h_o2, h_a2, h_o_len, h_o2_len = data['hist_obs'], data['hist_act'], data['hist_obs2'], data['hist_act2'], data['hist_obs_len'], data['hist_obs2_len']
+
+        q1, q1_extracted_memory = self.ac.q1(o, a, h_o, h_a, h_o_len)
+        q2, q2_extracted_memory = self.ac.q2(o, a, h_o, h_a, h_o_len)
+
+        # Bellman backup for Q functions
+        with torch.no_grad():
+            pi_targ, _ = self.ac_targ.pi(o2, h_o2, h_a2, h_o2_len)
+
+            # Target policy smoothing
+            if self.use_target_policy_smooth:
+                epsilon = torch.randn_like(pi_targ) * self.target_noise
+                epsilon = torch.clamp(epsilon, -self.noise_clip, self.noise_clip)
+                a2 = pi_targ + epsilon
+                a2 = torch.clamp(a2, -self.act_limit, self.act_limit)
+            else:
+                a2 = pi_targ
+
+            # Target Q-values
+            q1_pi_targ, _ = self.ac_targ.q1(o2, a2, h_o2, h_a2, h_o2_len)
+            q2_pi_targ, _ = self.ac_targ.q2(o2, a2, h_o2, h_a2, h_o2_len)
+
+            if self.use_double_critic:
+                q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+            else:
+                q_pi_targ = q1_pi_targ
+            backup = r + gamma * (1 - d) * q_pi_targ
+
+        # MSE loss against Bellman backup
+        loss_q1 = ((q1 - backup) ** 2).mean()
+        loss_q2 = ((q2 - backup) ** 2).mean()
+
+        if self.use_double_critic:
+            loss_q = loss_q1 + loss_q2
+        else:
+            loss_q = loss_q1
+
+        # Useful info for logging
+        # import pdb; pdb.set_trace()
+        loss_info = dict(Q1Vals=q1.detach().cpu().numpy(),
+                         Q2Vals=q2.detach().cpu().numpy(),
+                         Q1ExtractedMemory=q1_extracted_memory.mean(dim=1).detach().cpu().numpy(),
+                         Q2ExtractedMemory=q2_extracted_memory.mean(dim=1).detach().cpu().numpy())
+
+        return loss_q, loss_info
+
+
+        # Set up function for computing TD3 pi loss
+    def compute_loss_pi(self, data):
+        o, h_o, h_a, h_o_len = data['obs'], data['hist_obs'], data['hist_act'], data['hist_obs_len']
+        a, a_extracted_memory = self.ac.pi(o, h_o, h_a, h_o_len)
+        q1_pi, _ = self.ac.q1(o, a, h_o, h_a, h_o_len)
+        loss_info = dict(ActExtractedMemory=a_extracted_memory.mean(dim=1).detach().cpu().numpy())
+        return -q1_pi.mean(), loss_info
+
+
+    def update(self, data, timer):
+        # First run one gradient descent step for Q1 and Q2
+        self.q_optimizer.zero_grad()
+        loss_q, loss_info = self.compute_loss_q(data)
+        loss_q.backward()
+        self.q_optimizer.step()
+
+        # Possibly update pi and target networks
+        if timer % self.policy_delay == 0:
+            # Freeze Q-networks so you don't waste computational effort
+            # computing gradients for them during the policy learning step.
+            for p in self.q_params:
+                p.requires_grad = False
+
+            # Next run one gradient descent step for pi.
+            self.pi_optimizer.zero_grad()
+            loss_pi, loss_info_pi = self.compute_loss_pi(data)
+            loss_pi.backward()
+            self.pi_optimizer.step()
+
+            # Unfreeze Q-networks so you can optimize it at next DDPG step.
+            for p in self.q_params:
+                p.requires_grad = True
+
+            # Finally, update target networks by polyak averaging.
+            with torch.no_grad():
+                for p, p_targ in zip(self.ac.parameters(), self.ac_targ.parameters()):
+                    # NB: We use an in-place operations "mul_", "add_" to update target
+                    # params, as opposed to "mul" and "add", which would make new tensors.
+                    p_targ.data.mul_(self.polyak)
+                    p_targ.data.add_((1 - self.polyak) * p.data)
+    
+    def get_action(self, o, o_buff, a_buff, o_buff_len, noise_scale, device=None):
+        h_o = torch.tensor(o_buff).view(1, o_buff.shape[0], o_buff.shape[1]).float().to(device)
+        h_a = torch.tensor(a_buff).view(1, a_buff.shape[0], a_buff.shape[1]).float().to(device)
+        h_l = torch.tensor([o_buff_len]).float().to(device)
+        with torch.no_grad():
+            a = self.ac.act(torch.as_tensor(o, dtype=torch.float32).view(1, -1).to(device),
+                       h_o, h_a, h_l).reshape(self.act_dim)
+        a += noise_scale * np.random.randn(self.act_dim)
+        return np.clip(a, -self.act_limit, self.act_limit)
+    
+    # TODO: FIX ENVIRONMENT
+    # def test_agent(self.):
+    #     for j in range(self.num_test_episodes):
+    #         o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
+
+    #         if max_hist_len > 0:
+    #             o_buff = np.zeros([max_hist_len, obs_dim])
+    #             a_buff = np.zeros([max_hist_len, act_dim])
+    #             o_buff[0, :] = o
+    #             o_buff_len = 0
+    #         else:
+    #             o_buff = np.zeros([1, obs_dim])
+    #             a_buff = np.zeros([1, act_dim])
+    #             o_buff_len = 0
+
+    #         while not (d or (ep_len == max_ep_len)):
+    #             # Take deterministic actions at test time (noise_scale=0)
+    #             a = get_action(o, o_buff, a_buff, o_buff_len, 0, device)
+    #             o2, r, d, _ = test_env.step(a)
+
+    #             ep_ret += r
+    #             ep_len += 1
+    #             # Add short history
+    #             if max_hist_len != 0:
+    #                 if o_buff_len == max_hist_len:
+    #                     o_buff[:max_hist_len - 1] = o_buff[1:]
+    #                     a_buff[:max_hist_len - 1] = a_buff[1:]
+    #                     o_buff[max_hist_len - 1] = list(o)
+    #                     a_buff[max_hist_len - 1] = list(a)
+    #                 else:
+    #                     o_buff[o_buff_len + 1 - 1] = list(o)
+    #                     a_buff[o_buff_len + 1 - 1] = list(a)
+    #                     o_buff_len += 1
+    #             o = o2
+
+
 
     def reset_world(self):
         self.crash = 0
@@ -715,73 +983,90 @@ class LearningNode(Node):
 
         ### TRAINING IN EACH STEP ###
         if self.tstep == 0:
-            self.state, _ = self.get_state(ranges_arr, [0]*self.action_dim)
+            self.state, _ = self.get_state(ranges_arr, [0] * self.action_dim)
+            self.ep_ret = 0
+            self.ep_len = 0
+            self.previous_action = np.float32([0, 0])
+            if self.max_hist_len > 0:
+                o_buff = np.zeros([self.max_hist_len, self.obs_dim])
+                a_buff = np.zeros([self.max_hist_len, self.act_dim])
+                o_buff[0, :] = self.state
+                o_buff_len = 0
+            else:
+                o_buff = np.zeros([1, self.obs_dim])
+                a_buff = np.zeros([1, self.act_dim])
+                o_buff_len = 0
+        
+        # Randomly draw actions until we get over start steps
+        if self.all_n_steps > self.start_steps:
+            print("Getting Action From Model...")
+            a = self.get_action(self.state, o_buff, a_buff, o_buff_len, self.act_noise, self.device)
+
+        else:
+            # v, w
+            print("Randomly Sampling Actions...")
+            a = np.array([np.random(-1, 1), np.random(-1, 1)])
 
         self.state = np.float32(self.state)
 
-        # Evaluate model every 10 time steps
-        if self.episode%10!=0:
-            action = self.agent.select_action(self.state)
-        else:
-            action = self.agent.select_action(self.state, eval=True)
-        
         # Unnormalizaed action
         unnorm_action = np.array([
-            action_unnormalized(action[0], self.v_max, self.v_min),     # v
-            action_unnormalized(action[1], self.w_max, self.w_min)      # w
-            ])
+            action_unnormalized(a[0], self.v_max, self.v_min),     # v
+            action_unnormalized(a[1], self.w_max, self.w_min)      # w
+        ])
         
-        # Do a step
-        #print("self.state",self.state)
-        next_state, reward, done = self.step(unnorm_action, self.previous_action, ranges_arr)
-        #print("next_state",next_state)
+        next_state, reward = self.step(unnorm_action, self.previous_action, ranges_arr)
+
+        self.ep_ret += reward
+        self.ep_len += 1
+        self.all_n_steps += 1
+
         next_state = np.float32(next_state)
 
         # update previous action
-        self.previous_action = copy.deepcopy(action)
+        self.previous_action = copy.deepcopy(a)
 
         # Summary reward
         self.total_rewards = self.total_rewards + reward
         
-        # convert next_state to float32
-        if self.episode%10!=0 or len(self.replay_buffer) > self.warm_up * self.batch_size:
-            if reward == 100:
-                print("MAXIMUM REWARD!")
-                # Collect 3 times
-                for _ in range(3):
-                    self.replay_buffer.push(self.state, action, reward, next_state, done)
+        self.replay_buffer.store(self.state, a, reward, next_state, self.done)
+
+        # Add short history
+        if self.max_hist_len != 0:
+            if o_buff_len == self.max_hist_len:
+                o_buff[:self.max_hist_len - 1] = o_buff[1:]
+                a_buff[:self.max_hist_len - 1] = a_buff[1:]
+                o_buff[self.max_hist_len - 1] = list(self.state)
+                a_buff[self.max_hist_len - 1] = list(a)
+
             else:
-                self.replay_buffer.push(self.state, action, reward, next_state, done)
-       
-        if self.episode%10!=0 and len(self.replay_buffer) > self.warm_up * self.batch_size:
-            self.agent.update_parameters(self.replay_buffer, self.batch_size)
+                o_buff[o_buff_len + 1 - 1] = list(self.state)
+                a_buff[o_buff_len + 1 - 1] = list(a)
+                o_buff_len += 1
+
         self.state = copy.deepcopy(next_state)
 
         # increase step
-        print("self.tstep before",self.tstep)
         self.tstep = self.tstep + 1
-        print("self.tstep after",self.tstep)
+
+        print(f"Step: {self.tstep}, Reward: {reward}, Total Reward: {self.total_rewards}, Episode Length: {self.ep_len}, Episode Return: {self.ep_ret}")
 
         # Check maximum time step
-        if self.tstep >= self.max_tstep:
-            done = True
+        if self.tstep > self.steps_per_epoch:
+            self.done = True
 
-        # update result
-        if self.episode%10==0 and len(self.replay_buffer) > self.warm_up * self.batch_size:
-            result = self.total_rewards
-            self.rewards.append(result)
+        if self.tstep >= self.update_after and self.t % self.update_every == 0:
+            print("Updating Model...")
+            for j in range(self.update_every):
+                batch = self.replay_buffer.sample_batch_with_history(self.batch_size, self.max_hist_len)
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                self.update(data=batch, timer=j)
         
-        # save model every 20 episode
-        print("self.episode------------",self.episode)
-        if self.episode%20==0 and  self.episode !=0 :
-            self.agent.save_models(self.episode)
-
-        # reset world if it's done
-        print("value done",done)
-        if done:
+        if self.done:
+            print(f"Done — Episode: {self.episode}, Total Reward: {self.total_rewards}, Episode Length: {self.ep_len}, Episode Return: {self.ep_ret}")
+            print(f"Crash: {self.crash}")
             self.reset_world()
-        
-        print("TEST: ReplayBuffer length:", len(self.replay_buffer))
+            self.episode += 1
 
 
     def publisher_vel(self,v,w):
