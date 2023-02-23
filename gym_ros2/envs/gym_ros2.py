@@ -25,6 +25,9 @@ from std_srvs.srv._empty import Empty_Request
 from time import sleep
 from gym.envs.registration import register
 import math
+import threading
+from queue import Queue
+from gazebo_msgs.msg import ModelState
 
 # AUXILAIRY FUNCTIONS
 def check_crash(ranges_arr, min_range):
@@ -77,21 +80,38 @@ def check_win(x_now, y_now, x_goal, y_goal, goal_r):
 # ========
 
 class LearningNode(Node):
-    def __init__(self, x_init, y_init, x_target, y_target, min_range):
+    def __init__(self, x_init, y_init, x_target, y_target, min_range, env2ros, ros2env):
         super().__init__('wowowow')
         self.velPub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.dummy_req = Empty_Request()
         self.reset = self.create_client(Empty, '/reset_simulation')
         self.reset.call_async(self.dummy_req)
 
-        # self.timer_period = .5 # seconds
-        # self.timer = self.create_timer(self.timer_period, self.call_back)
+        self.timer_period = .5 # seconds
+        self.timer = self.create_timer(self.timer_period, self.callback)
 
         self.x_init = x_init
         self.y_init = y_init
         self.x_target = x_target
         self.y_target = y_target
         self.min_range = min_range
+
+        self.env2ros = env2ros
+        self.ros2env = ros2env
+    
+    def callback(self):
+        if not self.env2ros.empty():
+            # env2ros = "get_state", "reset_world", [v, w]
+            cmd = self.env2ros.get()
+
+            if cmd == "get_state":
+                self.ros2env.put(self.get_state())
+
+            elif cmd == "reset_world":
+                self.reset_world()
+
+            else:
+                self.publisher_vel(cmd[0], cmd[1])
         
     def odom_receive(self):
 
@@ -102,7 +122,7 @@ class LearningNode(Node):
         # z = msg_odom.pose.pose.position.z
         
         orientation_q = msg_odom.pose.pose.orientation
-        orientation_list = [ orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w ]
+        orientation_list = [ orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
         (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
         
         return x,y,yaw
@@ -145,7 +165,6 @@ class LearningNode(Node):
         self.velPub.publish(velMsg)
     
     def reset_world(self):
-        from gazebo_msgs.msg import ModelState
 
         self.reset.call_async(self.dummy_req)
 
@@ -219,16 +238,23 @@ class ROS2Env(gym.Env):
         self.y_goal = y_goal
         self.min_range = min_range
         self.initial_dis = get_goal_distance(x_init, y_init, x_goal, y_goal)
+        self.train = train
         
-        rclpy.init()
+        # Queues for communication
+        self.env2ros = Queue()
+        self.ros2env = Queue()
 
-        if train:
-            self.node_obj = LearningNode(x_init, y_init, x_goal, y_goal, min_range)
-            rclpy.spin(self.node_obj)
+        rclpy.init()
+        self.executor = rclpy.executors.MultiThreadedExecutor()
+
+        if self.train:
+            self.node = LearningNode(self.x_init, self.y_init, self.x_goal, self.y_goal, self.min_range, self.env2ros, self.ros2env)
+            self.executor.add_node(self.node)
         else:
             raise NotImplementedError
-            self.node_obj=TestingNode()
-            rclpy.spin(self.node_obj)
+        
+        self.executor_thread = threading.Thread(target=self.executor.spin, daemon=True)
+        self.executor_thread.start()
     
     def get_reward(self, state):
 
@@ -260,15 +286,13 @@ class ROS2Env(gym.Env):
             raw_action = [0.0, -3.14]
         
         # Start Running
-        self.node_obj.publisher_vel(raw_action[0], raw_action[1])
+        self.env2ros.put(raw_action[0], raw_action[1])
+        self.node_obj.put(0.0, 0.0)
 
-        # Wait for 0.5 seconds
-        sleep(0.5)
+        # Get Next State
+        self.env2ros.put("get_state")
 
-        # Stop
-        self.node_obj.publisher_vel(0.0, 0.0)
-
-        next_state = self.node_obj.get_state()
+        next_state = self.ros2env.get(block=True)
 
         # Reward
         reward = self.get_reward(next_state)
@@ -296,12 +320,7 @@ class ROS2Env(gym.Env):
     def render(self, mode='human'):
         pass
 
-    def close (self):
-        self.node_obj.destroy_node()
+    def close(self):
+        self.executor_thread.join()
+        # self.node.destroy_node()
         rclpy.shutdown()
-
-register(
-    id="gym_ros2-v0",
-    entry_point="gym_ros2.envs:ROS2Env",
-    max_episode_steps=500,
-)
