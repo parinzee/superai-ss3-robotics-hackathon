@@ -70,18 +70,6 @@ def robotSetPos(setPosPub, x, y, theta):
     checkpoint.pose.position.y = float(y)
     checkpoint.pose.position.z = 0.0
 
-def check_crash(ranges_arr, min_range):
-    """
-    : Description : Check robot is crashing the obstacle or not
-    : Input :
-        ranges_arr - List(float32) => List of Lidar sensor
-        min_range  - float32       => Minimum range for detecting crashing
-    : Output :
-        is_crash   - Boolean       => Robot is crashing (True) / Not crashing (False)
-    """
-    is_crash = min(ranges_arr) < min_range
-    return is_crash
-
     [x_q,y_q,z_q,w_q] = quaternion_from_euler(0.0,0.0,radians(theta))
 
     checkpoint.pose.orientation.x = x_q
