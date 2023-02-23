@@ -1,4 +1,5 @@
 import gym
+
 from gym import spaces
 
 import rclpy
@@ -28,6 +29,9 @@ import math
 import threading
 from queue import Queue
 from gazebo_msgs.msg import ModelState
+import torch
+
+torch.autograd.set_detect_anomaly(True)
 
 # AUXILAIRY FUNCTIONS
 def check_crash(ranges_arr, min_range):
@@ -41,7 +45,6 @@ def check_crash(ranges_arr, min_range):
     """
     is_crash = min(ranges_arr) < min_range
     return is_crash
-
 
 def get_goal_distance(x_now, y_now, x_goal, y_goal):
     """
@@ -75,7 +78,7 @@ def check_win(x_now, y_now, x_goal, y_goal, goal_r):
         is_win = True
     else:
         is_win = False
-    return is_win, current_distance
+    return is_win
 
 # ========
 
@@ -104,11 +107,14 @@ class LearningNode(Node):
             # env2ros = "get_state", "reset_world", [v, w]
             cmd = self.env2ros.get()
 
+
             if cmd == "get_state":
                 self.ros2env.put(self.get_state())
 
+
             elif cmd == "reset_world":
                 self.reset_world()
+                self.ros2env.put(self.get_state())
 
             else:
                 self.publisher_vel(cmd[0], cmd[1])
@@ -116,6 +122,7 @@ class LearningNode(Node):
     def odom_receive(self):
 
         _, msg_odom = self.wait_for_message('/odom', Odometry)
+   
          
         x = msg_odom.pose.pose.position.x
         y = msg_odom.pose.pose.position.y
@@ -151,7 +158,11 @@ class LearningNode(Node):
         ranges_arr, _, _, _ = self.scan_receive()
         distance = get_goal_distance(x, y, self.x_target, self.y_target)
 
-        return ranges_arr + [x, y, yaw, distance, self.x_target, self.y_target]
+        merged =  np.array(list(ranges_arr) + [x, y, yaw, distance, self.x_target, self.y_target])
+
+        # Remove nan
+        merged = np.nan_to_num(merged, posinf=4.0, neginf=0.0)
+        return merged
         
     
     def publisher_vel(self,v,w):
@@ -229,7 +240,7 @@ class ROS2Env(gym.Env):
         self.action_space = spaces.Discrete(5) 
 
         # Observation Space = Laserscan + Robot Pose + distance + target
-        self.observation_space = spaces.Discrete(360 + 3 + 1 + 2)
+        self.observation_space = spaces.Box(shape=(360 + 3 + 1 + 2,), dtype=np.float64, low=-999.0, high=999.0)
 
         # Initialize data variables
         self.x_init = x_init
@@ -263,6 +274,9 @@ class ROS2Env(gym.Env):
             return -100
         
         if check_win(*state[360:362], self.x_goal, self.y_goal, self.min_range):
+            print(state[360:362])
+            print(self.x_goal)
+            print(self.y_goal)
             print("WON!")
             return 100
         
@@ -286,7 +300,7 @@ class ROS2Env(gym.Env):
             raw_action = [0.0, -3.14]
         
         # Start Running
-        self.env2ros.put(raw_action[0], raw_action[1])
+        self.env2ros.put([raw_action[0], raw_action[1]])
         self.env2ros.put([0.0, 0.0])
 
         # Get Next State
@@ -315,9 +329,10 @@ class ROS2Env(gym.Env):
 
     def reset(self):
         self.env2ros.put("reset_world")
-        self.env2ros.put("get_state")
 
-        return self.ros2env.get(block=True)
+        state = self.ros2env.get()
+
+        return state
 
     def render(self, mode='human'):
         pass
