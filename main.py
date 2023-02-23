@@ -1,8 +1,8 @@
 import gym
-import gym_ros2
+from gym_ros2.envs import gym_ros2
 from stable_baselines3 import PPO
 
-env = gym.make("gym_ros2-v0")
+env = gym_ros2.ROS2Env()
 model = PPO("MlpPolicy", env, verbose=1)
 model.learn(total_timesteps=1e6)
 model.save("ppo_gym_ros2")

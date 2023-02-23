@@ -287,7 +287,7 @@ class ROS2Env(gym.Env):
         
         # Start Running
         self.env2ros.put(raw_action[0], raw_action[1])
-        self.node_obj.put(0.0, 0.0)
+        self.env2ros.put([0.0, 0.0])
 
         # Get Next State
         self.env2ros.put("get_state")
@@ -314,8 +314,10 @@ class ROS2Env(gym.Env):
         return next_state, reward, done, info
 
     def reset(self):
-        self.node_obj.reset_world()
-        return self.node_obj.get_state()
+        self.env2ros.put("reset_world")
+        self.env2ros.put("get_state")
+
+        return self.ros2env.get(block=True)
 
     def render(self, mode='human'):
         pass
